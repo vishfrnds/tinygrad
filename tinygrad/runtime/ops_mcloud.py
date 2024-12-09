@@ -1,3 +1,4 @@
+# Trying to add memory to cloud device so we do not need to transfer weights every time we start cloud server.
 import binascii
 from collections import defaultdict
 from dataclasses import dataclass
@@ -18,8 +19,6 @@ from tinygrad.runtime.ops_cloud import (
   ProgramExec,
 )
 from tinygrad.tensor import Tensor
-
-# Trying to add memory to cloud device so we do not need to transfer weights every time we start cloud server.
 
 
 def h(d: bytes) -> str:
@@ -90,8 +89,6 @@ class MCloudHandler(CloudHandler):
       return super()._do(method)
 
 # Frontend
-
-
 class MCloudDevice(CloudDevice):
   def __init__(self, device: str):
     print(f"INITIALIZING MCloudDevice init with device {device}")
@@ -134,8 +131,8 @@ class MCloudDevice(CloudDevice):
       clouddev = json.loads(response.decode())
       print('VISH', clouddev[3])
       self.loaded_models = read_server_memory(clouddev[3])
-      for model in self.loaded_models:
-        for buffer in model.buffers:
+      for model_name, saved_buffers in self.loaded_models.items():
+        for buffer in saved_buffers:
           self.hash_to_global[buffer.hash] = buffer.id
       if DEBUG >= 1:
         print(f"MCloudDevice hash_to_global: {self.hash_to_global}")
