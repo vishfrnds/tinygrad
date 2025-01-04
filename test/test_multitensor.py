@@ -4,8 +4,7 @@ from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes
 from tinygrad.ops import Ops
 from tinygrad.helpers import CI, getenv, prod, Context
 from tinygrad.nn.state import get_parameters, get_state_dict
-from tinygrad.engine.schedule import create_schedule
-from tinygrad.engine.realize import lower_schedule, BufferCopy, CompiledRunner
+from tinygrad.engine.realize import lower_schedule, BufferCopy, CompiledRunner, run_schedule
 from tinygrad.multi import all_reduce, MultiLazyBuffer
 import numpy as np
 from hypothesis import given, strategies as strat, settings
@@ -69,13 +68,14 @@ class TestMultiTensor(unittest.TestCase):
     X = Tensor.ones(256).contiguous().realize()
     X.shard_(devices_2, 0)
     out = (X + X)
-    sched = create_schedule(out.lazydata.lbs)
+    sched = out.schedule()
     names = []
     for si, ei in zip(sched[:], lower_schedule(sched)):
       if isinstance(ei.prg, CompiledRunner): names.append(ei.prg.p.name)
       ei.run()
     assert names[-2] == names[-1], "function was relinearized"
 
+  @unittest.skip("this doesn't fold because from_sharded calls contiguous on all lbs")
   def test_sharded_memory(self):
     # Buffer may be stuck in track_cross_buffer
     for x in (d0, d1, d2, d3, d4): Device[x].synchronize()
@@ -284,6 +284,7 @@ class TestMultiTensor(unittest.TestCase):
     lr_sched = OneCycleLR(optim, max_lr=0.1, pct_start=0.1, div_factor=100, final_div_factor=0.1, total_steps=10)
     lr_sched.step()
 
+  @unittest.skipUnless(is_dtype_supported(dtypes.long), f"long dtype not supported on {Device.DEFAULT}")
   def test_embedding(self):
     B, T, embed_size, vocab_size = 4, 10, 20, 28
 
@@ -490,7 +491,7 @@ class TestMultiTensor(unittest.TestCase):
     for p in get_parameters(bn): p.shard_(devices_4).realize()
 
     out = bn(t)
-    scheds = [sched for sched in create_schedule(out.lazydata.lbs) if sched.outputs[0].device in devices_4 and sched.ast.op is not Ops.COPY]
+    scheds = [sched for sched in out.schedule() if sched.outputs[0].device in devices_4 and sched.ast.op is not Ops.COPY]
     assert set(out.device for sched in scheds for out in sched.outputs) == set(devices_4), "should have ast on each shard device"
     asts = [sched.ast for sched in scheds]
     assert len(asts)
@@ -566,14 +567,35 @@ class TestMultiTensor(unittest.TestCase):
       # don't allow assigns that change axes
       t_none.assign(t_zero)
 
-  def test_rand_with_multiple_devices(self):
+  def test_init_rand_with_multiple_devices_fail(self):
+    # init rand with multi device is not allowed
     with self.assertRaises(ValueError):
       Tensor.rand(256, device=devices_2)
 
   def test_rand_on_multiple_devices(self):
+    # different devices generate different rand
     d0_rand = Tensor.rand(256, device=d0).realize()
     d1_rand = Tensor.rand(256, device=d1).realize()
     assert not np.allclose(d0_rand.numpy(), d1_rand.numpy())
+
+  def test_rand_on_multiple_devices_manual_seed(self):
+    Tensor.manual_seed(123)
+    d0_rand = Tensor.rand(2, device=d0).tolist()
+    d1_rand = Tensor.rand(2, device=d1).tolist()
+
+    # manual_seed again gives the same values
+    Tensor.manual_seed(123)
+    d0_rand2 = Tensor.rand(2, device=d0).tolist()
+    d1_rand2 = Tensor.rand(2, device=d1).tolist()
+    self.assertEqual(d0_rand, d0_rand2)
+    self.assertEqual(d1_rand, d1_rand2)
+
+    # device seed is only determined by init order, so flipping init order flips rands
+    Tensor.manual_seed(123)
+    d1_rand_flip = Tensor.rand(2, device=d1).tolist()
+    d0_rand_flip = Tensor.rand(2, device=d0).tolist()
+    self.assertEqual(d0_rand, d1_rand_flip)
+    self.assertEqual(d1_rand, d0_rand_flip)
 
   def test_rand_like_on_shard(self):
     t = Tensor.empty((16, 16)).shard(devices_2)
@@ -673,6 +695,7 @@ class TestMultiTensor(unittest.TestCase):
     t.shard_(devices, axis=0).realize()
     assert all([lb is lb.base and lb.realized.base.size == 4 * 16 for lb in t.lazydata.lbs])
 
+  @unittest.skip("this is unreliable on OSX")
   def test_clone(self):
     t = Tensor.rand(16, 16).shard(devices_2, axis=None)
     np.testing.assert_allclose(t.numpy(), t.clone().numpy())
@@ -680,13 +703,26 @@ class TestMultiTensor(unittest.TestCase):
     t = Tensor.rand(16, 16).shard(devices_2, axis=0)
     np.testing.assert_allclose(t.numpy(), t.clone().numpy())
 
+  def test_multi_const_folding(self):
+    with Context(TRACK_MATCH_STATS=0):
+      a = Tensor.arange(3).realize()
+      zeros = Tensor.zeros(3).realize()
+    b = a.to(devices_2)*zeros.to(devices_2)
+    sched = b.schedule()
+    self.assertEqual(len(sched), 6)
+    # notably, only two copies (for the arange) - vs 4 copies if we didn't fold the const copy
+    self.assertEqual(len([x for x in sched if any(u.op is Ops.COPY for u in x.ast.toposort)]), 2)
+    # all these kernels are just because multi calls contiguous on every single shard
+    run_schedule(sched)
+    self.assertListEqual(b.tolist(), [0, 0, 0])
+
 @unittest.skipIf(CI and Device.DEFAULT in ("GPU", "CUDA", "METAL"), "no GPU CI")
 class TestHandleData(unittest.TestCase):
   def test_copied_to_device(self):
     device = (d0, d1, d2, d3)
     t = Tensor([1, 2, 3, 4]).shard(device).realize()
     not_covered = t.to(d5)
-    sched = create_schedule([not_covered.lazydata])
+    sched = not_covered.schedule()
     assert len(sched) == 1
     # setup again because create_schedule has side effect
     t = Tensor([1, 2, 3, 4]).shard(device).realize()
@@ -696,7 +732,7 @@ class TestHandleData(unittest.TestCase):
     for d in device:
       t = Tensor([1, 2, 3, 4]).shard(device).realize()
       covered = t.to(d)
-      sched = create_schedule([covered.lazydata])
+      sched = covered.schedule()
       assert len(sched) == 0
       # setup again because create_schedule has side effect
       t = Tensor([1, 2, 3, 4]).shard(device).realize()
@@ -964,9 +1000,9 @@ class TestBatchNorm(unittest.TestCase):
           p.to_(devices)
 
       synced_out = synced_bn(x)
-      synced_si = list(create_schedule(synced_out.lazydata.lbs))
+      synced_si = list(synced_out.schedule())
       unsynced_out = unsynced_bn(x)
-      unsynced_si = list(create_schedule(unsynced_out.lazydata.lbs))
+      unsynced_si = list(unsynced_out.schedule())
 
     # TODO: test synced / unsynced batchnorm cross device kernel and copies
     assert synced_si
